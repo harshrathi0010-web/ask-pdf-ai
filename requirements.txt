@@ -12,5 +12,5 @@ langchain
 langchain-text-splitter
 sentence-transformers
 faiss-cpu
-
+pypdf
 
