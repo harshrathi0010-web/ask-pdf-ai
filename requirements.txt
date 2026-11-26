@@ -9,8 +9,11 @@ nltk
 streamlit
 huggingface
 langchain
-langchain-text-splitter
+langchain-text-splitters
 sentence-transformers
 faiss-cpu
 pypdf
+python-docx
+transformers
+torch
 

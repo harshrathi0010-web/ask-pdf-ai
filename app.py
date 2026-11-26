@@ -6,6 +6,7 @@ import torch
 import faiss
 import numpy as np
 from pypdf import PdfReader
+from docx import Document
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from sentence_transformers import SentenceTransformer
 from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
@@ -41,7 +42,7 @@ def load_llm():
 # ---------------------PDF Processing---------------------------
 
 def extract_pages(file_bytes):
-    # return a list of (page_number,text) for pages that contain text.....
+    # Return page-number/text pairs for PDF pages that contain text.
     reader=PdfReader(io.BytesIO(file_bytes))
 
     pages=[]
@@ -52,16 +53,35 @@ def extract_pages(file_bytes):
 
     return pages
 
-def build_index(pages):
-    # Split pages into chunks, embed them, and store them in a FAISS index
+def extract_document_sources(file_bytes, file_name):
+    extension = file_name.lower().rsplit(".", 1)[-1]
+    if extension == "pdf":
+        return [
+            (f"Page {page_number}", text)
+            for page_number, text in extract_pages(file_bytes)
+        ]
+    if extension == "docx":
+        document = Document(io.BytesIO(file_bytes))
+        content = [paragraph.text.strip() for paragraph in document.paragraphs]
+        content.extend(
+            " | ".join(cell.text.strip() for cell in row.cells)
+            for table in document.tables
+            for row in table.rows
+        )
+        text = "\n".join(part for part in content if part)
+        return [("Word document", text)] if text else []
+    raise ValueError("Unsupported document type. Upload a PDF or DOCX file.")
+
+def build_index(sources):
+    # Split document sources into chunks, embed them, and store them in FAISS.
     splitter=RecursiveCharacterTextSplitter(
         chunk_size=CHUNK_SIZE,chunk_overlap=CHUNK_OVERLAP
     )
 
     chunks=[]
-    for page_num,text in pages:
+    for source,text in sources:
         for piece in splitter.split_text(text):
-            chunks.append({"page":page_num,"text":piece})
+            chunks.append({"source":source,"text":piece})
 
     if not chunks:
         return None, []
@@ -112,15 +132,35 @@ def generate(prompt,max_new_tokens=200):
 
 def answer_question(question,index,chunks):
     hits=retrieve(question,index,chunks)
-    context="\n\n".join(h["text"] for h in hits)
-    prompt=(
-        "Answer the question using only the context below. Give a complete answer "
-        "in one or more sentences. If the answer is not in the context, reply "
-        "\"I could not find this in the document.\"\n\n"
-        f"Context:\n{context}\n\n"
-        f"Question: {question}\n"
-        "Answer:"
+    tokenizer,_,_=load_llm()
+    instruction=(
+        "Answer the question using only the document excerpts. Give a direct, "
+        "clear answer and do not repeat the excerpts. If the answer is not "
+        "present, say \"I could not find this in the document.\"\n\n"
+        "Document excerpts:\n"
     )
+    question_prompt=f"\n\nQuestion: {question}\nAnswer:"
+    fixed_tokens=len(tokenizer.encode(
+        instruction+question_prompt,
+        add_special_tokens=True,
+    ))
+    remaining=max(0,MAX_INPUT_TOKENS-fixed_tokens-32)
+    excerpts=[]
+    for hit in hits:
+        source_label=f"[{hit['source']}] "
+        label_tokens=tokenizer.encode(source_label,add_special_tokens=False)
+        text_tokens=tokenizer.encode(hit["text"],add_special_tokens=False)
+        text_budget=remaining-len(label_tokens)-2
+        if text_budget <= 0:
+            break
+        excerpt=tokenizer.decode(
+            label_tokens+text_tokens[:text_budget],
+            skip_special_tokens=True,
+        )
+        excerpts.append(excerpt)
+        remaining-=len(label_tokens)+min(len(text_tokens),text_budget)+2
+    context="\n\n".join(excerpts)
+    prompt=instruction+context+question_prompt
     return generate(prompt),hits
 
 def summarize_document(chunks, max_parts=8):
@@ -148,62 +188,60 @@ def summarize_document(chunks, max_parts=8):
 st.set_page_config(page_title="PDF AI assistant",page_icon="⚡🤖⚡︎ ",layout="wide")
 
 st.title("⚡🤖⚡ PDF AI assistant ⚡🤖⚡")
-st.text("Upload your PDF Document here to get answer related to your document\nThis bot will help you summarize your document")
+st.text("Upload a PDF or Word document to ask questions or request a summary.")
 
 
-st.sidebar.subheader("Upload your PDF file and ask he questions")
+st.sidebar.subheader("Upload a PDF or Word document")
 
-file=st.sidebar.file_uploader("Upload your PDF file",type=["pdf"])
+file=st.sidebar.file_uploader("Upload a PDF or Word document",type=["pdf","docx"])
+if file is not None:
+    st.sidebar.success(f"Uploaded {file.name} successfully.")
 
-question=st.text_input("Ask questions related to your PDF document")
+question=st.text_input("Ask a question about your document")
 
-if st.button("Ask AI"):
+with st.container(horizontal=True):
+    ask_clicked = st.button("Ask AI")
+    summarize_clicked = st.button("Summarize PDF")
+
+if ask_clicked or summarize_clicked:
     if file is None:
-        st.error("Please upload your PDF document first.")
-    elif not question.strip():
+        st.error("Please upload a document first.")
+    elif ask_clicked and not question.strip():
         st.warning("Please ask a question first.")
     else:
-        with st.spinner("Reading PDF and finding relevant sections..."):
+        action = "summarize" if summarize_clicked else "answer"
+        spinner_text = (
+            "Reading document and generating summary..."
+            if summarize_clicked
+            else "Reading document and finding relevant sections..."
+        )
+        with st.spinner(spinner_text):
             try:
-                pages=extract_pages(file.getvalue())
-                if not pages:
-                    st.error("This PDF does not contain readable text.")
+                sources=extract_document_sources(file.getvalue(), file.name)
+                if not sources:
+                    st.error("This document does not contain readable text.")
                     st.stop()
 
-                index,chunks=build_index(pages)
+                index,chunks=build_index(sources)
                 if index is None:
-                    st.error("No text chunks could be created from this PDF.")
+                    st.error("No text chunks could be created from this document.")
                     st.stop()
 
-                matches=retrieve(question,index,chunks)
-                context="\n\n".join(
-                    f"[Page {match['page']}] {match['text']}"
-                    for match in matches
-                )
-                prompt=f"Answer the question using only the context below.\n\nContext:\n{context}\n\nQuestion: {question}\nAnswer:"
+                if summarize_clicked:
+                    summary = summarize_document(chunks)
+                    st.subheader("Document summary")
+                    st.write(summary or "The model did not produce a summary.")
+                else:
+                    answer,matches=answer_question(question,index,chunks)
 
-                tokenizer,llm,device=load_llm()
-                inputs=tokenizer(
-                    prompt,
-                    return_tensors="pt",
-                    truncation=True,
-                    max_length=MAX_INPUT_TOKENS,
-                ).to(device)
-                outputs=llm.generate(
-                    **inputs,
-                    max_new_tokens=256,
-                    do_sample=False,
-                )
-                answer=tokenizer.decode(outputs[0],skip_special_tokens=True).strip()
+                    st.subheader("Answer")
+                    st.write(answer or "The model did not produce an answer.")
 
-                st.subheader("Answer")
-                st.write(answer or "The model did not produce an answer.")
-
-                st.subheader("Sources")
-                for match in matches:
-                    st.caption(
-                        f"Page {match['page']} - similarity {match['score']:.3f}"
-                    )
-                    st.write(match["text"])
+                    st.subheader("Sources")
+                    for match in matches:
+                        st.caption(
+                            f"{match['source']} - similarity {match['score']:.3f}"
+                        )
+                        st.write(match["text"])
             except Exception as exc:
-                st.error(f"Could not answer the question: {exc}")
+                st.error(f"Could not {action} the document: {exc}")
